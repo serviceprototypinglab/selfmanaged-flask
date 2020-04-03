@@ -1,0 +1,84 @@
+#!/bin/bash
+# Fail-safe invocation of a flask application
+
+requireroot=0
+
+sudoprefix(){
+	if [ $requireroot = 1 ]
+	then
+		sudo $*
+	else
+		$*
+	fi
+}
+
+failsafe(){
+	script=`realpath $1`
+	logdir=`dirname $script`
+	bname=`basename $script`
+	echo "(starting failsafe operation for $bname...)"
+	while true
+	do
+		date >> $logdir/.$bname.log
+		sudoprefix python3 $logdir/$bname >> $logdir/.$bname.log 2>&1 &
+		cpid=`ps wauxf | grep $bname | grep -v grep | grep -v supervisor | awk '{print $2}'`
+		echo "(registered pid $cpid)"
+		needskill=1
+		for i in `seq 300`
+		do
+			sleep 1
+			ps wauxf | grep -v grep | grep -q $cpid
+			ret=$?
+			if [ $ret != 0 ]
+			then
+				needskill=0
+				echo "(child died, no termination necessary)"
+				break
+			fi
+		done
+		if [ $needskill = 1 ]
+		then
+			echo "(preventive termination)"
+			sudoprefix kill -9 $cpid
+		fi
+	done
+}
+
+if [ $requireroot = 1 ]
+then
+	if [ `id -u` != 0 ]
+	then
+		echo "Error: Must invoke this script as root (as during boot-up)." >&2
+		exit 1
+	fi
+fi
+
+script=$1
+if [ -z $script ]
+then
+	echo "Syntax: $0 <flaskservice.py> [stop]" >&2
+	exit 1
+fi
+
+bn=`basename $script`
+
+pids=`ps wauxf | grep $bn | grep -v grep | awk '{print $2}' | grep -v $$ | tr '\n' ' '`
+if [ ! -z "$pids" ]
+then
+	sudoprefix kill -9 $pids >/dev/null 2>&1
+fi
+pids=`ps wauxf | grep flasksupervisor | grep -v vim | grep -v grep | awk '{print $2}' | grep -v $$ | tr '\n' ' '`
+if [ ! -z "$pids" ]
+then
+	sudoprefix kill -9 $pids >/dev/null 2>&1
+fi
+
+if [ ! -z "$2" ]
+then
+	if [ "$2" = "stop" ]
+	then
+		exit
+	fi
+fi
+
+failsafe $script &

@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+# Blocking of IP addresses not following a flask application's defined URIs
+
+import socket
+import threading
+import subprocess
+import time
+import sys
+import select
+import json
+import ast
+
+class Wrapper(threading.Thread):
+    def __init__(self, sx, port):
+        threading.Thread.__init__(self)
+        self.sx = sx
+        self.port = port
+
+    def run(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        print(f"[T][begin thread {self.ident} on {self.sx}]")
+        print(f"[T][connect to localhost:{self.port}...]")
+        s.connect(("", self.port))
+        print(f"[T][connected]")
+        counter = 0
+        s.setblocking(False)
+        self.sx.setblocking(False)
+        while counter < 20:
+            hasdata = False
+            try:
+                data = self.sx.recv(1024)
+            except:
+                pass
+            else:
+                if len(data) > 0:
+                    hasdata = True
+                    print(f"[recv@net {len(data)} bytes]")
+                    l = s.send(data)
+                    print(f"[send@app {l} bytes]")
+            try:
+                data = s.recv(1024)
+            except:
+                pass
+            else:
+                if len(data) > 0:
+                    hasdata = True
+                    print(f"[recv@app {len(data)} bytes]")
+                    l = self.sx.send(data)
+                    print(f"[send@net {l} bytes]")
+            if not hasdata:
+                time.sleep(0.5)
+                counter += 1
+        s.close()
+        print(f"[T][disconnected]")
+
+class Flask2Ban:
+    BLACKLISTTHRESHOLD = 2
+
+    def __init__(self):
+        pass
+
+    def storeblacklist(self, blacklist):
+        f = open(".flask2ban.blacklist", "w")
+        json.dump(blacklist, f)
+        f.close()
+
+    def loadblacklist(self):
+        try:
+            f = open(".flask2ban.blacklist")
+        except:
+            return {}
+        blacklist = json.load(f)
+        print(f"[blacklist with {len(blacklist)} entries loaded]")
+        f.close()
+        return blacklist
+
+    # FIXME: This method overlaps with l3/testing to some degree.
+    def match(self, inspector, uri, verb):
+        if not inspector:
+            return True
+        inpattern = False
+        for c in inspector.uris:
+            cpart = c.split("/")
+            upart = uri.split("/")
+            if len(cpart) == len(upart):
+                inpattern = True
+                for i in range(len(cpart)):
+                    if not cpart[i].startswith("<") and cpart[i] != upart[i]:
+                        inpattern = False
+                        break
+                    if cpart[i].startswith("<"):
+                        part = cpart[i][1:-1]
+                        part = part.split(":")
+                        if len(part) == 2:
+                            if part[0] == "int":
+                                if not upart[i].isdigit():
+                                    inpattern = False
+                                    break
+            if inpattern:
+                return True
+        return False
+
+    def work(self, p, s, inspector=None):
+        blacklist = self.loadblacklist()
+
+        poll = {}
+        poll[p.stdout] = select.poll()
+        poll[p.stdout].register(p.stdout, select.POLLIN)
+        poll[p.stderr] = select.poll()
+        poll[p.stderr].register(p.stderr, select.POLLIN)
+
+        while True:
+            if s:
+                try:
+                    sx, saddr = s.accept()
+                except Exception as e:
+                    pass
+                else:
+                    if saddr[0] in blacklist and blacklist[saddr[0]] >= self.BLACKLISTTHRESHOLD:
+                        print(f"<refuse {saddr[0]} via blacklist>")
+                        continue
+                    w = Wrapper(sx, inspector.port)
+                    w.start()
+
+            hasline = False
+            for channel in (p.stdout, p.stderr):
+                if not poll[channel].poll(1):
+                    continue
+                line = channel.readline()
+                if not line:
+                    continue
+                line = line.decode().strip()
+                hasline = True
+                csym = {p.stdout: ">>", p.stderr: "!!"}
+                print(csym[channel], "#", line, "#")
+                if channel == p.stderr:
+                    try:
+                        ip, d1, d2, dtd, dtt, verb, uri, proto, status, d3 = line.split(" ")
+                        verb = verb[1:]
+                        result = False
+                        # FIXME: These rules need to be read from kbboot.json with flask matching
+                        if not self.match(inspector, uri, verb):
+                            result = True
+                        ignorelist = ("/favicon.ico", "robots.txt")
+                        if uri in ignorelist:
+                            result = False
+                        print("(", ip, ")", result)
+                        if result:
+                            blacklist[ip] = blacklist.get(ip, 0) + 1
+                            print(f"<add {ip} to blacklist with weight {blacklist[ip]}>")
+                            self.storeblacklist(blacklist)
+                    except Exception as e:
+                        pass
+            if not hasline:
+                time.sleep(0.5)
+
+    def procmain(self, flaskservice, network=None, inspector=None):
+        s = None
+        if network:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("", network))
+            s.listen(20)
+            s.setblocking(False)
+            port = None
+            if inspector:
+                port = inspector.port
+            print(f"[open network interface {network}->{port}]")
+
+        p = subprocess.Popen(["python3", flaskservice], shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        print(f"[begin background process {p.pid}]")
+        killchild = False
+        try:
+            self.work(p, s, inspector)
+        except Exception as e:
+            killchild = True
+        except:
+            pass
+        print(f"[end background process {p.pid}]")
+        if killchild:
+            # For shell-wrapped python invocation terminate p.pid+1/+2; not using right now due to shell=False above
+            pass
+        p.terminate()
+        p.kill()
+
+class Inspector:
+    def __init__(self):
+        self.port = 80
+        self.uris = []
+
+    # FIXME: This method overlaps with l3boot to some degree.
+    def submerge(self, flaskservice):
+        a = ast.parse(open(flaskservice).read(), flaskservice)
+
+        uris = []
+        for el in a.body:
+            if isinstance(el, ast.FunctionDef):
+                for dec in el.decorator_list:
+                    obj = dec.func.value.id
+                    meth = dec.func.attr
+                    if obj == "app" and meth == "route":
+                        uri = dec.args[0].s
+                        uris.append(uri)
+
+        self.uris = uris
+        port = self.submergerec(a)
+        if port:
+            self.port = port
+
+    def submergerec(self, a):
+        if isinstance(a, ast.Expr):
+            if isinstance(a.value, ast.Call):
+                fun = a.value
+                obj = fun.func.value.id
+                meth = fun.func.attr
+                if meth == "run":
+                    for kw in fun.keywords:
+                        if kw.arg == "port":
+                            return kw.value.n
+        if not "body" in dir(a):
+            return
+        for el in a.body:
+            p = self.submergerec(el)
+            if p:
+                return p
+
+def main(argv):
+    if len(argv) != 2:
+        print("Syntax: flask2ban <flaskservice.py>", file=sys.stderr)
+        exit(-1)
+
+    flaskservice = argv[1]
+    ins = Inspector()
+    ins.submerge(flaskservice)
+
+    f2b = Flask2Ban()
+    f2b.procmain(flaskservice, network=10080, inspector=ins)
+
+main(sys.argv)

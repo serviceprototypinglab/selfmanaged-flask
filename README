@@ -1,0 +1,7 @@
+These two small scripts support the self-managed operation of a Flask-based service.
+
+flask2ban
+	- ensure the service is not pestered more than once/twice/... by clients not adhering to the URL paths declaratively defined by the implementation
+
+flasksupervisor
+	- ensure the service is always up and running, by detecting crashes and preemtively restarting to avoid hanging processes

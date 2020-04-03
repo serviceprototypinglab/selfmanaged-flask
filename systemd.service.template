@@ -1,0 +1,10 @@
+# Activate: sudo cp YOURSERVICE.service /etc/systemd/system/
+#         + sudo systemctl enable YOURSERVICE.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/home/xxx/flasksupervisor YOURSERVICE.py
+
+[Install]
+WantedBy=multi-user.target
